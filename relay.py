@@ -50,11 +50,24 @@ ook niet, dan valt hij terug op de OKX-ratio. Test met:
     python3 tapebot.py --status
 
 --------------------------------------------------------------------------------
+BYBIT EN BITGET
+--------------------------------------------------------------------------------
+Ook Bybit weigert Amerikaanse IP-adressen. De route /beurs geeft twee publieke
+endpoints van Bybit en Bitget door:
+
+    /beurs?url=<volledige https-url van het endpoint>
+
+Alleen de combinaties in BEURS_TOEGESTAAN mogen door; al het andere krijgt 403.
+Testen in je browser:  https://<jouw-relay>.onrender.com/health/beurzen
+
+--------------------------------------------------------------------------------
 """
 
 import json
 import os
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 from flask import Flask, jsonify, request
@@ -78,6 +91,14 @@ TOEGESTAAN = {
     "/futures/data/topLongShortPositionRatio",
     "/futures/data/openInterestHist",
     "/futures/data/takerlongshortRatio",
+}
+
+# Voor /beurs: alleen deze combinaties van host en pad, alleen https.
+# api.bytick.com is het tweede, officiële adres van Bybit.
+BEURS_TOEGESTAAN = {
+    ("api.bybit.com", "/v5/market/account-ratio"),
+    ("api.bytick.com", "/v5/market/account-ratio"),
+    ("api.bitget.com", "/api/v2/mix/market/account-long-short"),
 }
 
 
@@ -119,6 +140,74 @@ def long_short():
     return jsonify(data)
 
 
+def haal_ruw(url):
+    """Haalt een url op en geeft (statuscode, tekst). Fouten van de beurs gaan mee terug."""
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        try:
+            tekst = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            tekst = ""
+        return e.code, tekst
+
+
+def beurs_toegestaan(url):
+    try:
+        u = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    return u.scheme == "https" and (u.netloc.lower(), u.path) in BEURS_TOEGESTAAN
+
+
+@app.route("/beurs")
+def beurs():
+    """
+    /beurs?url=https://api.bybit.com/v5/market/account-ratio?category=linear&...
+    Geeft het antwoord van Bybit of Bitget ongewijzigd door.
+    """
+    doel = request.args.get("url", "")
+    if not beurs_toegestaan(doel):
+        host = urllib.parse.urlparse(doel).netloc or "?"
+        return jsonify({"error": f"niet toegestaan: {host}{urllib.parse.urlparse(doel).path}"}), 403
+
+    nu = time.time()
+    if doel in _cache and nu - _cache[doel][0] < CACHE_SECONDS:
+        return app.response_class(_cache[doel][1], mimetype="application/json")
+    try:
+        code, tekst = haal_ruw(doel)
+    except Exception as e:
+        return jsonify({"error": f"geen verbinding met de beurs: {str(e)[:150]}"}), 502
+    if code != 200:
+        # bijvoorbeeld als de beurs ook Frankfurt weert
+        return jsonify({"error": f"beurs gaf HTTP {code}: {' '.join(tekst.split())[:150]}"}), 502
+    _cache[doel] = (nu, tekst)
+    return app.response_class(tekst, mimetype="application/json")
+
+
+@app.route("/health/beurzen")
+def health_beurzen():
+    """Kan de relay Bybit en Bitget bereiken? Handig om in je browser te openen."""
+    proeven = {
+        "bybit": "https://api.bybit.com/v5/market/account-ratio"
+                 "?category=linear&symbol=BTCUSDT&period=4h&limit=3",
+        "bitget": "https://api.bitget.com/api/v2/mix/market/account-long-short"
+                  "?symbol=BTCUSDT&productType=USDT-FUTURES&period=4h",
+    }
+    uit = {}
+    for naam, url in proeven.items():
+        try:
+            code, tekst = haal_ruw(url)
+            ok = code == 200 and ('"retCode":0' in tekst.replace(" ", "")
+                                  or '"code":"00000"' in tekst.replace(" ", ""))
+            uit[naam] = {"ok": ok, "http": code, "begin": " ".join(tekst.split())[:120]}
+        except Exception as e:
+            uit[naam] = {"ok": False, "error": str(e)[:150]}
+    return jsonify(uit), (200 if all(v.get("ok") for v in uit.values()) else 502)
+
+
 @app.route("/health")
 def health():
     """Snelle controle of de relay Binance echt kan bereiken."""
@@ -134,7 +223,7 @@ def health():
 
 @app.route("/")
 def index():
-    return "Binance-relay actief. Gebruik /health om te testen."
+    return ("Relay actief. Test Binance met /health en Bybit/Bitget met /health/beurzen.")
 
 
 if __name__ == "__main__":
